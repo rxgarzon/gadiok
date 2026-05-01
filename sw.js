@@ -9,10 +9,10 @@ self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME).then(cache =>
       cache.addAll([
-        '/POS/index.html',
-        '/POS/manifest.json',
-        '/POS/icon-192.png',
-        '/POS/icon-512.png'
+        '/gadiok/index.html',
+        '/gadiok/manifest.json',
+        '/gadiok/icon-192.png',
+        '/gadiok/icon-512.png'
       ]).catch(() => {}) // Si alguno falla no detiene la instalación
     )
   );
@@ -32,7 +32,7 @@ self.addEventListener('activate', event => {
 // ── Fetch: responder con cache si no hay red ──────────────────
 self.addEventListener('fetch', event => {
   // Solo cachear recursos propios (no Supabase ni CDNs)
-  if (!event.request.url.includes('/POS/')) return;
+  if (!event.request.url.includes('/gadiok/')) return;
   event.respondWith(
     caches.match(event.request).then(cached => {
       return cached || fetch(event.request).then(response => {
@@ -41,7 +41,7 @@ self.addEventListener('fetch', event => {
         caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
         return response;
       });
-    }).catch(() => caches.match('/POS/index.html'))
+    }).catch(() => caches.match('/gadiok/index.html'))
   );
 });
 
