@@ -99,7 +99,7 @@ body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:var(-
   #print-area .gracias { text-align:center; margin-top:8px; font-size:10px; }
 }
 
-/* PP */
+/* APP */
 #app{display:none}
 .shell{max-width:430px;margin:0 auto;background:var(--surface);height:100dvh;
   display:flex;flex-direction:column;position:relative;overflow:hidden;
@@ -3026,3 +3026,16 @@ async function imprimirCorte() {
     win.document.close(); win.print();
   }
 }
+
+// ════════════════════════════════════════════════════
+// INICIALIZAR BASE DE DATOS AL CARGAR LA PÁGINA
+// ════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', async () => {
+  try {
+    await abrirDB();
+    console.log('[INIT] IndexedDB lista');
+    await guardarConfigSW();
+  } catch(e) {
+    console.error('[INIT] Error abriendo IndexedDB:', e);
+  }
+});
