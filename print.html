@@ -1336,7 +1336,7 @@ async function doLogin() {
     // Consultar tabla vendedores
     let res;
     try {
-      res = await sb.from('vendedores').select('identificador,nombre,codigo,activo').eq('nombre', nom).eq('activo', true).single();
+      res = await sb.from('vendedores').select('identificador,nombre,codigo,activo').eq('nombre', nom).single();
     } catch(e) {
       err.textContent = 'Error de red: ' + e.message;
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
@@ -1344,19 +1344,19 @@ async function doLogin() {
     }
 
     if (res.error) {
-      err.textContent = 'Error: ' + res.error.message;
+      err.textContent = 'Error Supabase: ' + res.error.message + ' | Código: ' + res.error.code;
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
       return;
     }
 
     if (!res.data) {
-      err.textContent = 'Usuario no encontrado';
+      err.textContent = 'Vendedor no encontrado: ' + nom;
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
       return;
     }
 
-    if (res.data.codigo !== cod) {
-      err.textContent = 'Código incorrecto';
+    if (String(res.data.codigo) !== String(cod)) {
+      err.textContent = 'Código incorrecto (esperado: ' + res.data.codigo + ')';
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
       return;
     }
@@ -1958,4 +1958,1071 @@ async function finalizarVenta() {
   const snapPago  = pago;
 
   // Mostrar ticket de inmediato
-  ticketVen
+  ticketVenta(cliente, ahora, abono, saldo, f, snapItems, snapTotal, snapPago);
+
+  // Flash decorativo por 1s (no bloquea nada)
+  flash.style.display = 'flex';
+  setTimeout(() => { flash.style.display = 'none'; }, 1000);
+
+  // Limpiar carrito DESPUÉS de haber abierto el ticket
+  document.getElementById('vAbono').value = '';
+  document.getElementById('clienteSelect').value = '';
+  document.getElementById('cliSelText').textContent = '— Selecciona cliente —';
+  document.getElementById('cliSelText').className = 'cli-sel-placeholder';
+  document.getElementById('cliSelected').classList.remove('err');
+  carrito = []; total = 0; renderCarrito();
+  Promise.all([mostrarResumen(), mostrarCreditos()]).catch(() => {});
+  if (online) syncAll().catch(() => {});
+}
+
+// ════════════════════════════════════════════════════
+// TICKET VENTA
+// ════════════════════════════════════════════════════
+function ticketVenta(cliente, fecha, abono, saldo, f, snapItems, snapTotal, snapPago) {
+  const items = snapItems || carrito;
+  const tot   = snapTotal != null ? snapTotal : total;
+  const met   = snapPago  || pago;
+  document.getElementById('t-fecha').innerText    = fmtF(fecha);
+  document.getElementById('t-cliente').innerText  = cliente;
+  document.getElementById('t-vendedor').innerText = 'Vendedor: ' + cod3(USER.nombre);
+  document.getElementById('t-folio').innerText    = f;
+  document.getElementById('t-total').innerText    = '$' + tot.toFixed(2);
+  document.getElementById('t-pago').innerText     = met;
+  document.getElementById('t-items').innerHTML    = items.map(i => {
+    const esPza = i.unidad === 'pza';
+    const cantLabel = esPza ? `×${i.cantidad} pza` : `${i.cantidad} kg`;
+    const sub = i.sub || i.cantidad * i.precio;
+    return `<div class="tp-item"><div class="tp-item-name">${i.nombre}</div><div class="tp-item-qty">${cantLabel}</div><div class="tp-item-precio">$${i.precio.toFixed(2)}</div><div class="tp-item-total">$${sub.toFixed(2)}</div></div>`;
+  }).join('');
+  const ar = document.getElementById('t-abono-row');
+  const sr = document.getElementById('t-saldo-row');
+  if (met === 'Crédito') {
+    if (abono > 0) { ar.style.display='flex'; document.getElementById('t-abono').innerText='$'+abono.toFixed(2); }
+    else ar.style.display = 'none';
+    sr.style.display = 'flex'; document.getElementById('t-saldo').innerText = '$'+saldo.toFixed(2);
+  } else { ar.style.display='none'; sr.style.display='none'; }
+  openM('m-ticket');
+}
+
+// ════════════════════════════════════════════════════
+// SYNC COMPLETO — en background
+// ════════════════════════════════════════════════════
+async function syncAll() {
+  if (!online) { console.warn('[syncAll] abortado: offline'); return; }
+  console.log('[syncAll] iniciando...');
+  try {
+    // 0. Clientes
+    for (const c of await idb.all('clientes_q')) {
+      const { uid: _u, ...row } = c;
+      const { error } = await withTimeout(sb.from('clientes').upsert([row], { onConflict: 'uuid_local' }), 5000).catch(e=>({error:e}));
+      if (!error) await idb.del('clientes_q', c.uid);
+      else console.warn('sync cliente:', error.message);
+    }
+
+    // 1. Ventas — asignar folio si quedó vacío offline
+    const ventasPend = await idb.all('ventas_q');
+    console.log('[syncAll] ventas pendientes:', ventasPend.length);
+    for (const v of ventasPend) {
+      let folio = v.folio || '';
+      if (!folio) {
+        // Pedir folio único a Supabase ahora que hay internet
+        try {
+          const { data, error } = await withTimeout(sb.rpc('incrementar_folio', { p_tipo: 'VTA' }), 4000);
+          if (!error && data) folio = 'VTA-' + String(data).padStart(4,'0');
+        } catch(e) { console.warn('folio en sync:', e.message); }
+      }
+      const { uid: _u, ...row } = v;
+      row.folio = folio;
+      const { error } = await withTimeout(sb.from('ventas').upsert([row], { onConflict: 'uuid_local' }), 5000).catch(e=>({error:e}));
+      if (!error) {
+        await idb.del('ventas_q', v.uid); lsBackupDel('ventas_q', v.uid);
+        // Actualizar folio en tx_dia y creditos_vivos si cambió
+        if (folio && folio !== v.folio) {
+          const tx = await idb.get('tx_dia', v.uid);
+          if (tx) { tx.folio = folio; await idb.put('tx_dia', tx); }
+          const todos = await idb.all('creditos_vivos');
+          const cred = todos.find(c => c.venta_uuid === v.uid);
+          if (cred) { cred.folio = folio; await idb.put('creditos_vivos', cred); }
+        }
+      } else console.warn('[syncAll] error upsert venta:', error.message);
+    }
+
+    // 1.5 Detalles de venta
+    for (const d of await idb.all('ventas_detalle_q')) {
+      const { uid: _u, ...row } = d;
+      const { error } = await withTimeout(
+        sb.from('ventas_detalle').upsert([row], { onConflict: 'uuid_local' }), 5000
+      ).catch(e=>({error:e}));
+      if (!error) {
+        await idb.del('ventas_detalle_q', d.uid);
+        lsBackupDel('ventas_detalle_q', d.uid);
+      } else console.warn('[syncAll] error upsert detalle:', error.message);
+    }
+
+    // 2. Créditos
+    for (const c of await idb.all('creditos_q')) {
+      // Actualizar folio si el crédito vivo ya lo tiene actualizado
+      const vivo = await idb.get('creditos_vivos', c.uid);
+      if (vivo?.folio && !c.folio) c.folio = vivo.folio;
+      const { uid: _u, ...row } = c;
+      const { error } = await withTimeout(sb.from('creditos').upsert([row], { onConflict: 'uuid_local' }), 5000).catch(e=>({error:e}));
+      if (!error) { await idb.del('creditos_q', c.uid); lsBackupDel('creditos_q', c.uid); }
+      else console.warn('sync credito:', error.message);
+    }
+
+    // 3. Abonos — asignar folio si quedó vacío offline
+    for (const a of await idb.all('abonos_q')) {
+      let folio = a.folio || '';
+      if (!folio) {
+        try {
+          const { data, error } = await withTimeout(sb.rpc('incrementar_folio', { p_tipo: 'ABO' }), 4000);
+          if (!error && data) folio = 'ABO-' + String(data).padStart(4,'0');
+        } catch(e) { console.warn('folio abo en sync:', e.message); }
+      }
+      const { uid: _u, ...row } = a;
+      row.folio = folio;
+      const { error } = await withTimeout(sb.from('abonos').upsert([row], { onConflict: 'uuid_local' }), 5000).catch(e=>({error:e}));
+      if (!error) {
+        await idb.del('abonos_q', a.uid);
+        // Actualizar folio en tx_dia y en el array de abonos del crédito vivo
+        if (folio && folio !== a.folio) {
+          const tx = await idb.get('tx_dia', a.uid);
+          if (tx) { tx.folio = folio; await idb.put('tx_dia', tx); }
+          const cred = await idb.get('creditos_vivos', a.credito_uuid);
+          if (cred) {
+            const ab = (cred.abonos||[]).find(x => x.uid === a.uid);
+            if (ab) { ab.folio = folio; await idb.put('creditos_vivos', cred); }
+          }
+        }
+        if (a.credito_uuid) {
+          await withTimeout(sb.from('creditos').update({
+            saldo_pendiente: a.saldo_restante,
+            estatus: a.saldo_restante <= 0 ? 'CERRADO' : 'ABIERTO'
+          }).eq('uuid_local', a.credito_uuid), 5000).catch(()=>{});
+        }
+      } else console.warn('sync abono:', error.message);
+    }
+    // 4. Gastos
+    for (const g of await idb.all('gastos_q')) {
+      const { uid: _u, ...row } = g;
+      const { error } = await withTimeout(sb.from('gastos_dia').upsert([row], { onConflict: 'uuid_local' }), 5000).catch(e=>({error:e}));
+      if (!error) { await idb.del('gastos_q', g.uid); lsBackupDel('gastos_q', g.uid); }
+      else console.warn('[syncAll] error gasto:', error.message);
+    }
+  } catch(e) { console.error('[syncAll] excepción:', e); }
+  console.log('[syncAll] completado');
+  await badgeSync();
+}
+
+async function doSync(manual = false) {
+  if (!online) { if (manual) toast('Sin conexión', 'err'); return; }
+  if (manual) {
+    const b = document.getElementById('sync-badge');
+    b.textContent = '↑'; b.style.display = 'flex';
+  }
+  
+  // Sync normal
+  await syncAll();
+  await syncCreditos();
+  
+  // RESCATE AUTOMÁTICO 1: Créditos sin folio
+  await rescatarSinFolioInterno();
+  
+  // RESCATE AUTOMÁTICO 2: Créditos locales a tabla ventas
+  await rescatarCreditosAVentasInterno();
+  
+  await badgeSync();
+  if (manual) toast('✅ Sincronizado', 'ok');
+}
+
+// ════════════════════════════════════════════════════
+// RESCATAR CRÉDITOS SIN FOLIO (INTERNO - sin toast)
+// ════════════════════════════════════════════════════
+async function rescatarSinFolioInterno() {
+  if (!online) return;
+  
+  try {
+    // 1. Buscar en creditos_vivos (local) los que NO tienen folio
+    const vivos = await idb.all('creditos_vivos');
+    const sinFolio = vivos.filter(c => !c.folio || c.folio === '');
+    
+    if (sinFolio.length === 0) {
+      return;
+    }
+    
+    console.log(`[Rescate] Encontrados ${sinFolio.length} créditos sin folio:`, sinFolio.map(c => c.cliente));
+    
+    let rescatados = 0;
+    
+    for (const credito of sinFolio) {
+      // 2. Obtener folio nuevo
+      let folio = '';
+      try {
+        const { data, error } = await withTimeout(sb.rpc('incrementar_folio', { p_tipo: 'VTA' }), 4000);
+        if (!error && data) {
+          folio = 'VTA-' + String(data).padStart(4, '0');
+          console.log(`[Rescate] Folio asignado a ${credito.cliente}:`, folio);
+        }
+      } catch(e) {
+        console.warn(`[Rescate] Error obteniendo folio para ${credito.cliente}:`, e.message);
+        continue;
+      }
+      
+      if (!folio) continue;
+      
+      // 3. Subir a tabla CREDITOS
+      const creditoRow = {
+        uuid_local: credito.uuid_local || credito.uid,
+        venta_uuid: credito.venta_uuid,
+        folio: folio,
+        cliente: credito.cliente,
+        vendedor: credito.vendedor,
+        fecha: credito.fecha,
+        monto_total: credito.monto_total,
+        abono_inicial: credito.abono_inicial || 0,
+        saldo_pendiente: credito.saldo_pendiente,
+        estatus: credito.estatus || 'ABIERTO',
+        items_json: credito.items ? JSON.stringify(credito.items) : '[]'
+      };
+      
+      const { error: errorCredito } = await withTimeout(
+        sb.from('creditos').upsert([creditoRow], { onConflict: 'uuid_local' }), 
+        5000
+      ).catch(e => ({error: e}));
+      
+      if (errorCredito) {
+        console.error(`[Rescate] ❌ Error subiendo crédito ${credito.cliente}:`, errorCredito.message);
+        continue;
+      }
+      
+      console.log(`[Rescate] ✅ Crédito ${credito.cliente} subido a tabla creditos`);
+      
+      // 4. Subir a tabla VENTAS (CRÍTICO - todas las ventas van aquí)
+      const ventaRow = {
+        uuid_local: credito.venta_uuid,
+        folio: folio,
+        fecha: credito.fecha,
+        vendedor: credito.vendedor,
+        cliente: credito.cliente,
+        presentacion: credito.items?.map(i => i.nombre).join(', ') || '',
+        cantidad: credito.items?.reduce((a,i) => a + (i.cantidad||0), 0) || 0,
+        kilos: credito.items?.reduce((a,i) => {
+          // Solo sumar kg de items que no son tapas
+          const esTapa = (i.nombre||'').toLowerCase().includes('tapa');
+          return esTapa ? a : a + (i.cantidad||0);
+        }, 0) || 0,
+        precio_unitario: credito.items?.[0]?.precio || 0,
+        total: credito.monto_total,
+        pago: 'Crédito',
+        abono_inicial: credito.abono_inicial || 0,
+        items_json: credito.items ? JSON.stringify(credito.items) : '[]'
+      };
+      
+      const { error: errorVenta } = await withTimeout(
+        sb.from('ventas').upsert([ventaRow], { onConflict: 'uuid_local' }), 
+        5000
+      ).catch(e => ({error: e}));
+      
+      if (errorVenta) {
+        console.error(`[Rescate] ❌ Error subiendo venta ${credito.cliente}:`, errorVenta.message);
+        continue;
+      }
+      
+      console.log(`[Rescate] ✅ Venta ${credito.cliente} subida a tabla ventas`);
+      
+      // 5. Actualizar local
+      credito.folio = folio;
+      await idb.put('creditos_vivos', credito);
+      
+      // 6. Actualizar venta relacionada si existe
+      if (credito.venta_uuid) {
+        const tx = await idb.get('tx_dia', credito.venta_uuid);
+        if (tx) {
+          tx.folio = folio;
+          await idb.put('tx_dia', tx);
+        }
+      }
+      
+      rescatados++;
+    }
+    
+    // Refrescar pantalla
+    if (rescatados > 0) {
+      await mostrarCreditos();
+      console.log(`[Rescate] ✅ Rescatados ${rescatados} de ${sinFolio.length} créditos`);
+    }
+    
+  } catch(e) {
+    console.error('[Rescate] Error:', e);
+  }
+}
+
+async function badgeSync() {
+  const n = (await idb.all('ventas_q')).length + (await idb.all('creditos_q')).length + (await idb.all('abonos_q')).length + (await idb.all('clientes_q')).length + (await idb.all('ventas_detalle_q')).length;
+  const b = document.getElementById('sync-badge');
+  if (n > 0) {
+    b.style.display = 'flex'; b.textContent = n; b.classList.add('pulsing');
+    const bar = document.getElementById('sync-bar');
+    bar.style.display = 'block';
+    bar.style.background = '#fef3c7'; bar.style.color = '#92400e'; bar.style.borderBottom = '1px solid #fde68a';
+    bar.textContent = '⚠️ ' + n + ' registro' + (n > 1 ? 's' : '') + ' pendiente' + (n > 1 ? 's' : '') + ' de sincronizar';
+  } else {
+    b.style.display = 'none'; b.textContent = '0'; b.classList.remove('pulsing');
+    const bar = document.getElementById('sync-bar');
+    if (bar.textContent.includes('pendiente')) { bar.style.display = 'none'; bar.textContent = ''; }
+  }
+}
+
+// ── Medir calidad de conexión antes de sincronizar ───────────────────────
+async function conexionSuficiente() {
+  try {
+    const t0 = Date.now();
+    await withTimeout(fetch('https://www.gstatic.com/generate_204', { method: 'HEAD', cache: 'no-store' }), 3000);
+    const ms = Date.now() - t0;
+    // Si responde en menos de 4000ms la consideramos suficiente
+    return ms < 4000;
+  } catch { return false; }
+}
+
+// ════════════════════════════════════════════════════
+// RESCATAR CRÉDITOS QUE ESTÁN EN TABLA CREDITOS PERO NO EN VENTAS
+// ════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════
+// FORZAR SUBIDA DE TODOS LOS CRÉDITOS LOCALES A AMBAS TABLAS
+// ════════════════════════════════════════════════════
+async function rescatarCreditosAVentasInterno() {
+  if (!online) return;
+  
+  try {
+    // 1. Buscar TODOS los creditos_vivos
+    const vivos = await idb.all('creditos_vivos');
+    
+    if (vivos.length === 0) {
+      return;
+    }
+    
+    console.log(`[Forzar Sync] Encontrados ${vivos.length} créditos locales para subir`);
+    
+    let subidos = 0;
+    
+    for (const credito of vivos) {
+      let folio = credito.folio;
+      
+      // Si no tiene folio, obtener uno nuevo
+      if (!folio || folio === '') {
+        try {
+          const { data, error } = await withTimeout(sb.rpc('incrementar_folio', { p_tipo: 'VTA' }), 4000);
+          if (!error && data) {
+            folio = 'VTA-' + String(data).padStart(4, '0');
+            console.log(`[Forzar Sync] Folio asignado a ${credito.cliente}:`, folio);
+            
+            // Actualizar local con el nuevo folio
+            credito.folio = folio;
+            await idb.put('creditos_vivos', credito);
+            
+            // Actualizar tx_dia si existe
+            if (credito.venta_uuid) {
+              const tx = await idb.get('tx_dia', credito.venta_uuid);
+              if (tx) {
+                tx.folio = folio;
+                await idb.put('tx_dia', tx);
+              }
+            }
+          }
+        } catch(e) {
+          console.warn(`[Forzar Sync] Error obteniendo folio para ${credito.cliente}:`, e.message);
+          continue;
+        }
+      }
+      
+      if (!folio) continue;
+      
+      // 2. Subir a tabla CREDITOS (upsert = insert o update si ya existe)
+      const creditoRow = {
+        uuid_local: credito.uuid_local || credito.uid,
+        venta_uuid: credito.venta_uuid,
+        folio: folio,
+        cliente: credito.cliente,
+        vendedor: credito.vendedor,
+        fecha: credito.fecha,
+        monto_total: credito.monto_total,
+        abono_inicial: credito.abono_inicial || 0,
+        saldo_pendiente: credito.saldo_pendiente,
+        estatus: credito.estatus || 'ABIERTO',
+        items_json: credito.items ? JSON.stringify(credito.items) : '[]'
+      };
+      
+      const { error: errorCredito } = await withTimeout(
+        sb.from('creditos').upsert([creditoRow], { onConflict: 'uuid_local' }), 
+        5000
+      ).catch(e => ({error: e}));
+      
+      if (errorCredito) {
+        console.error(`[Forzar Sync] ❌ Error tabla creditos ${credito.cliente}:`, errorCredito.message);
+        continue;
+      }
+      
+      console.log(`[Forzar Sync] ✅ ${credito.cliente} → tabla creditos`);
+      
+      // 3. Subir a tabla VENTAS (upsert = insert o update si ya existe)
+      const ventaRow = {
+        uuid_local: credito.venta_uuid,
+        folio: folio,
+        fecha: credito.fecha,
+        vendedor: credito.vendedor,
+        cliente: credito.cliente,
+        presentacion: credito.items?.map(i => i.nombre).join(', ') || '',
+        cantidad: credito.items?.reduce((a,i) => a + (i.cantidad||0), 0) || 0,
+        kilos: credito.items?.reduce((a,i) => {
+          const esTapa = (i.nombre||'').toLowerCase().includes('tapa');
+          return esTapa ? a : a + (i.cantidad||0);
+        }, 0) || 0,
+        precio_unitario: credito.items?.[0]?.precio || 0,
+        total: credito.monto_total,
+        pago: 'Crédito',
+        abono_inicial: credito.abono_inicial || 0,
+        items_json: credito.items ? JSON.stringify(credito.items) : '[]'
+      };
+      
+      const { error: errorVenta } = await withTimeout(
+        sb.from('ventas').upsert([ventaRow], { onConflict: 'uuid_local' }), 
+        5000
+      ).catch(e => ({error: e}));
+      
+      if (errorVenta) {
+        console.error(`[Forzar Sync] ❌ Error tabla ventas ${credito.cliente}:`, errorVenta.message);
+        continue;
+      }
+      
+      console.log(`[Forzar Sync] ✅ ${credito.cliente} → tabla ventas`);
+      
+      subidos++;
+    }
+    
+    if (subidos > 0) {
+      console.log(`[Forzar Sync] ✅ Total subidos: ${subidos} de ${vivos.length} créditos`);
+    }
+    
+  } catch(e) {
+    console.error('[Forzar Sync] Error:', e);
+  }
+}
+
+// ── Respaldo localStorage (secundario a IndexedDB) ───────────────────────
+function lsBackupSave(store, key, val) {
+  try { localStorage.setItem('bk_' + store + '_' + key, JSON.stringify(val)); } catch(e) {}
+}
+function lsBackupDel(store, key) {
+  try { localStorage.removeItem('bk_' + store + '_' + key); } catch(e) {}
+}
+async function lsBackupRestore() {
+  // Al arrancar, rescatar de localStorage cualquier registro que no esté en IndexedDB
+  const stores = ['ventas_q','creditos_q','abonos_q','clientes_q','ventas_detalle_q'];
+  for (const store of stores) {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('bk_' + store + '_')) continue;
+      try {
+        const val = JSON.parse(localStorage.getItem(k));
+        if (val?.uid) {
+          const exists = await idb.get(store, val.uid);
+          if (!exists) { await idb.put(store, val); console.log('Rescatado de backup:', store, val.uid); }
+        }
+      } catch(e) {}
+    }
+  }
+}
+
+// Reintento automático cada 30 s si hay pendientes y señal suficiente
+setInterval(async () => {
+  if (!online) return;
+  const n = (await idb.all('ventas_q')).length + (await idb.all('creditos_q')).length + (await idb.all('abonos_q')).length + (await idb.all('clientes_q')).length;
+  if (n > 0) {
+    const buena = await conexionSuficiente();
+    if (buena) { syncAll().then(() => syncCreditos()).then(() => badgeSync()).catch(() => {}); }
+    else { console.log('Señal débil, reintento postpuesto'); }
+  }
+}, 30000);
+
+// ════════════════════════════════════════════════════
+// CRÉDITOS
+// ════════════════════════════════════════════════════
+async function getPend() {
+  const t = await idb.all('creditos_vivos');
+  return t.reduce((a,c) => a + (c.saldo_pendiente||0), 0);
+}
+async function getActivos() {
+  const t = await idb.all('creditos_vivos');
+  return t.filter(c => (c.saldo_pendiente||0) > 0).length;
+}
+
+async function mostrarCreditos(filtro = '') {
+  const todos    = await idb.all('creditos_vivos');
+  const el       = document.getElementById('listaCreditos');
+  const filtrado = filtro ? todos.filter(c => c.cliente.toLowerCase().includes(filtro.toLowerCase())) : todos;
+  const activos  = filtrado.filter(c => (c.saldo_pendiente||0) > 0);
+  const liquid   = filtrado.filter(c => (c.saldo_pendiente||0) <= 0);
+
+  if (!filtrado.length) {
+    el.innerHTML = '<div class="credits-empty"><div class="ce-ico">🎉</div><p>Sin créditos pendientes</p></div>';
+    return;
+  }
+
+  const renderCard = (v, liquidado) => {
+    const pct  = Math.round(((v.monto_total - v.saldo_pendiente) / v.monto_total) * 100);
+    const ftag = v.folio ? `<span style="font-size:10px;font-weight:800;color:#3b6ef8;background:#eef2ff;padding:2px 6px;border-radius:4px">${v.folio}</span>` : '';
+    const saldoColor = liquidado ? '#16a34a' : '#dc2626';
+    const saldoTxt   = liquidado ? 'LIQUIDADO' : `Saldo: $${(v.saldo_pendiente||0).toFixed(2)}`;
+    return `<div class="credit-card" style="${liquidado?'opacity:.7;border-left:3px solid #16a34a':''}">
+      <div class="cc-av">👤</div>
+      <div class="cc-info">
+        <div class="cc-name">${v.cliente} ${ftag}</div>
+        <div class="cc-fecha">${fmtF(v.fecha).slice(0,10)} ${new Date(v.fecha).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · ${cod3(v.vendedor)}</div>
+        <div class="cc-detail">Total: $${(v.monto_total||0).toFixed(2)} · Pagado: ${pct}%</div>
+        <div class="cc-saldo" style="color:${saldoColor}">${saldoTxt}</div>
+      </div>
+      <div class="cc-acts">
+        <button class="btn-tk" onclick="verCredito('${v.uid}')">📄</button>
+        ${!liquidado ? `<button class="btn-ab" onclick="abrirAbono('${v.uid}')">Abonar</button>` : ''}
+      </div>
+    </div>`;
+  };
+
+  let html = activos.map(v => renderCard(v, false)).join('');
+  if (liquid.length) {
+    html += `<div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px;padding-left:4px">Liquidados hoy</div>`;
+    html += liquid.map(v => renderCard(v, true)).join('');
+  }
+  el.innerHTML = html;
+}
+
+// ════════════════════════════════════════════════════
+// ABONOS
+// ════════════════════════════════════════════════════
+async function getCredito(k) {
+  let v = await idb.get('creditos_vivos', k);
+  if (!v) { const t = await idb.all('creditos_vivos'); v = t.find(c => c.uid===k || c.uuid_local===k) || null; }
+  return v;
+}
+
+async function abrirAbono(cUid) {
+  const v = await getCredito(cUid);
+  if (!v) { toast('Crédito no encontrado', 'err'); return; }
+  abonoT = v.uid;
+  document.getElementById('ab-info').innerHTML =
+    `<strong>${v.cliente}</strong>${v.folio ? ` <span style="font-size:11px;color:#3b6ef8;font-weight:700">${v.folio}</span>` : ''}<br>Total: <strong>$${(v.monto_total||0).toFixed(2)}</strong><br>Saldo: <strong style="color:var(--red)">$${(v.saldo_pendiente||0).toFixed(2)}</strong>`;
+  document.getElementById('ab-monto').value = '';
+  openM('m-abono');
+}
+
+async function confirmarAbono() {
+  if (!abonoT) return;
+  if (_abonoEnProceso) return;            // evitar doble toque
+  _abonoEnProceso = true;
+  const btnOk = document.querySelector('#m-abono .btn-ok');
+  if (btnOk) { btnOk.disabled = true; btnOk.textContent = '⏳ Guardando...'; }
+
+  try {
+  const v     = await getCredito(abonoT);
+  const monto = parseFloat(document.getElementById('ab-monto').value);
+  if (isNaN(monto) || monto <= 0)      { toast('Monto inválido', 'err'); return; }
+  if (!v)                               { toast('Crédito no encontrado', 'err'); return; }
+  if (monto > (v.saldo_pendiente||0))  { toast('Abono excede saldo', 'err'); return; }
+
+  const ahora = new Date();
+  const aUid  = uid();
+  const fAbo  = await obtenerFolioAbo();  // vacío si offline, se asigna al sync
+
+  v.abonos = v.abonos || [];
+  v.abonos.push({ uid: aUid, folio: fAbo, fecha: ahora.toISOString(), monto, vendedor_cobro: USER.nombre, vendedor_venta: v.vendedor });
+  v.saldo_pendiente -= monto;
+  v.liquidado = v.saldo_pendiente <= 0;
+  if (v.liquidado) v.estatus = 'CERRADO';
+  await idb.put('creditos_vivos', v);
+
+  // TX día
+  await idb.put('tx_dia', {
+    uid: aUid, folio: fAbo, tipo: 'abono',
+    vendedor: USER.nombre, cliente: v.cliente,
+    monto, metodo: 'Efectivo', abono: 0, saldo: 0,
+    fecha: ahora.toISOString(), items: []
+  });
+
+  // Cola abono — incluye folio (puede estar vacío si offline)
+  await idb.put('abonos_q', {
+    uid: aUid, uuid_local: aUid, folio: fAbo,
+    credito_uuid: v.uuid_local || v.uid,
+    cliente: v.cliente, vendedor_venta: v.vendedor,
+    vendedor_cobro: USER.nombre,
+    fecha: ahora.toISOString(), monto, saldo_restante: v.saldo_pendiente
+  });
+
+  // Sync inmediato si hay internet
+  if (online) {
+    withTimeout((async () => {
+      const aRow = await idb.get('abonos_q', aUid);
+      if (aRow) {
+        const { uid: _, ...aData } = aRow;
+        const { error: eA } = await sb.from('abonos').insert([aData]);
+        if (!eA || eA.code === '23505') await idb.del('abonos_q', aUid);
+      }
+      await sb.from('creditos').update({
+        saldo_pendiente: v.saldo_pendiente,
+        liquidado: v.saldo_pendiente <= 0,
+        estatus: v.saldo_pendiente <= 0 ? 'CERRADO' : 'ABIERTO'
+      }).eq('uuid_local', v.uuid_local || v.uid);
+    })(), 4000).catch(e => console.warn('sync abono:', e));
+    badgeSync().catch(()=>{});
+  }
+
+  closeM('m-abono');
+  ticketAbono(v, monto, fAbo, ahora);
+  Promise.all([mostrarCreditos(), mostrarResumen()]).catch(()=>{});
+  } catch(e) {
+    console.error('confirmarAbono error:', e);
+    toast('Error al guardar abono', 'err');
+  } finally {
+    _abonoEnProceso = false;
+    const b2 = document.querySelector('#m-abono .btn-ok');
+    if (b2) { b2.disabled = false; b2.textContent = 'Confirmar'; }
+  }
+}
+
+// ════════════════════════════════════════════════════
+// TICKET ABONO
+// ════════════════════════════════════════════════════
+async function ticketAbono(credito, monto, fAbo, fecha) {
+  const saldo  = credito.saldo_pendiente;
+  const abonos = credito.abonos || [];
+
+  document.getElementById('ta-fecha').innerText   = fmtF(fecha);
+  document.getElementById('ta-folio').innerText   = fAbo || '';
+  document.getElementById('ta-cliente').innerText = credito.cliente;
+  document.getElementById('ta-fcred').innerText   = 'Crédito: ' + (credito.folio || '');
+  document.getElementById('ta-cobro').innerText    = 'Cobro: ' + cod3(USER.nombre);
+  document.getElementById('ta-vendedor').innerText = 'Vendio: ' + cod3(credito.vendedor || '?');
+  document.getElementById('ta-monto').innerText   = '$' + monto.toFixed(2);
+  document.getElementById('ta-saldo').innerText   = '$' + saldo.toFixed(2);
+  document.getElementById('ta-saldo').style.color = saldo <= 0 ? '#16a34a' : '#dc2626';
+  document.getElementById('ta-status').innerText  = saldo <= 0 ? 'LIQUIDADO' : '';
+
+  // Productos: intentar desde el crédito, si no desde tx_dia
+  const prodWrap = document.getElementById('ta-productos-wrap');
+  const prodEl   = document.getElementById('ta-productos');
+  let items = credito.items || [];
+  if (!items.length && credito.venta_uuid) {
+    const tx = await idb.get('tx_dia', credito.venta_uuid).catch(() => null);
+    if (tx?.items?.length) items = tx.items;
+  }
+  if (!items.length) {
+    // Último intento: buscar en tx_dia por cliente y tipo venta
+    const todas = await idb.all('tx_dia').catch(() => []);
+    const tx = todas.find(t => t.cliente === credito.cliente && (t.tipo === 'venta' || t.tipo === 'venta_con_abono') && t.items?.length);
+    if (tx) items = tx.items;
+  }
+  if (items.length) {
+    prodEl.innerHTML = items.map(i => {
+      const sub = i.sub || i.subtotal || (i.cantidad * i.precio);
+      return `<div class="tp-row" style="font-size:11px"><span>${i.nombre} ×${i.cantidad} @ $${i.precio.toFixed(2)}</span><span>$${sub.toFixed(2)}</span></div>`;
+    }).join('');
+    prodWrap.style.display = 'block';
+  } else {
+    prodWrap.style.display = 'none';
+  }
+
+  // Historial de pagos con fecha, hora y saldo restante progresivo
+  const histEl = document.getElementById('ta-hist');
+  if (!abonos.length) {
+    histEl.innerHTML = '<div style="color:#94a3b8;font-size:11px;padding:2px 0">Sin pagos anteriores</div>';
+  } else {
+    let saldoAcum = credito.monto_total || 0;
+    histEl.innerHTML = abonos.map((ab, idx) => {
+      saldoAcum -= ab.monto;
+      const esEste  = ab.folio === fAbo;
+      const ftagHtml = ab.folio
+        ? `<span style="color:#3b6ef8;font-weight:700;font-size:10px">${ab.folio}</span> `
+        : '';
+      const fechaFmt = fmtF(ab.fecha);
+      return `<div style="padding:5px 0;border-bottom:1px dashed #e2e8f0;${esEste ? 'background:#f0fdf4;border-radius:6px;padding:5px 6px;margin:-1px -2px;' : ''}">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="font-size:11px;color:#475569">${ftagHtml}${fechaFmt}</span>
+          <span style="font-size:12px;color:#16a34a;font-weight:700">+$${ab.monto.toFixed(2)}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#94a3b8;margin-top:1px">
+          <span>${cod3(ab.vendedor_cobro || '?')}</span>
+          <span style="color:${saldoAcum > 0 ? '#dc2626' : '#16a34a'};font-weight:700">Saldo: $${saldoAcum.toFixed(2)}</span>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  openM('m-ticket-abono');
+}
+
+// ════════════════════════════════════════════════════
+// VER CRÉDITO
+// ════════════════════════════════════════════════════
+async function verCredito(cUid) {
+  const v = await getCredito(cUid);
+  if (!v) { toast('No encontrado', 'err'); return; }
+  const abonos  = v.abonos || [];
+  const saldo   = v.saldo_pendiente || 0;
+  const abonado = (v.monto_total||0) - saldo;
+  let hist = '';
+  if (!abonos.length) {
+    hist = '<div style="color:#94a3b8;font-size:12px;padding:4px 0">Sin abonos registrados</div>';
+  } else {
+    let s = v.monto_total;
+    abonos.forEach(ab => {
+      s -= ab.monto;
+      const abFecha = ab.fecha ? (() => { const d = new Date(ab.fecha); const dd = String(d.getDate()).padStart(2,'0'); const mm = String(d.getMonth()+1).padStart(2,'0'); const yy = d.getFullYear(); return `${dd}/${mm}/${yy}`; })() : '';
+      const ftag   = abFecha ? `<span style="color:#3b6ef8;font-weight:700;font-size:11px">${abFecha}</span> · ` : '';
+      const cobro  = cod3(ab.vendedor_cobro||'?');
+      const venta  = cod3(ab.vendedor_venta||v.vendedor||'?');
+      const mismos = cobro === venta;
+      hist += `<div class="ct-ab">
+        <div class="tp-row"><span>${ftag}${new Date(ab.fecha).toLocaleString()}</span><span style="color:#16a34a;font-weight:700">+$${ab.monto.toFixed(2)}</span></div>
+        <div class="tp-row" style="font-size:11px;color:#64748b"><span>Saldo restante:</span><span style="color:${s>0?'#dc2626':'#16a34a'};font-weight:700">$${s.toFixed(2)}</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#94a3b8;margin-top:1px">
+          <span>Cobro: <strong>${cobro}</strong>${!mismos ? ` · Venta: <strong>${venta}</strong>` : ''}</span>
+        </div>
+      </div>`;
+    });
+  }
+  document.getElementById('ct-fecha').innerText   = fmtF(new Date());
+  document.getElementById('ct-cliente').innerText = v.cliente;
+  document.getElementById('ct-folio').innerText   = v.folio || '';
+  document.getElementById('ct-info').innerText    = `Vendio: ${cod3(v.vendedor)} · ${fmtF(v.fecha).slice(0,10)}`;
+
+  // Productos de la venta
+  const ctItemsWrap = document.getElementById('ct-items-wrap');
+  const ctItems     = document.getElementById('ct-items');
+  let vItems = v.items || [];
+
+  // Si no hay items en creditos_vivos, buscar en tx_dia por venta_uuid
+  if (!vItems.length && v.venta_uuid) {
+    const tx = await idb.get('tx_dia', v.venta_uuid);
+    if (tx?.items?.length) vItems = tx.items;
+  }
+
+  // Último recurso: buscar en tx_dia por uid del crédito sin "_c"
+  if (!vItems.length) {
+    const keyBase = (v.uid || '').replace('_c', '');
+    const tx = await idb.get('tx_dia', keyBase);
+    if (tx?.items?.length) vItems = tx.items;
+  }
+
+  if (vItems.length) {
+    ctItems.innerHTML = vItems.map(i => {
+      const sub = i.sub || i.subtotal || (i.cantidad * i.precio);
+      const esPza2 = i.unidad === 'pza';
+      const cantLbl = esPza2 ? `×${i.cantidad} pza` : `${i.cantidad} kg`;
+      return `<div class="tp-item"><div class="tp-item-name">${i.nombre}</div><div class="tp-item-qty">${cantLbl}</div><div class="tp-item-precio">$${i.precio.toFixed(2)}</div><div class="tp-item-total">$${sub.toFixed(2)}</div></div>`;
+    }).join('');
+    ctItemsWrap.style.display = 'block';
+  } else {
+    ctItemsWrap.style.display = 'none';
+  }
+  document.getElementById('ct-montos').innerHTML  = `
+    <div class="tp-row"><span>Total venta:</span><span><strong>$${(v.monto_total||0).toFixed(2)}</strong></span></div>
+    <div class="tp-row"><span>Total abonado:</span><span style="color:#16a34a;font-weight:700">$${abonado.toFixed(2)}</span></div>`;
+  document.getElementById('ct-hist').innerHTML   = hist;
+  document.getElementById('ct-saldo').innerHTML  = `
+    <div class="tp-row" style="font-size:14px"><span>SALDO PENDIENTE:</span>
+    <span style="color:${saldo>0?'#dc2626':'#16a34a'};font-weight:800">$${saldo.toFixed(2)}</span></div>
+    ${saldo===0?'<div style="text-align:center;color:#16a34a;font-weight:700;margin-top:4px">LIQUIDADO</div>':''}`;
+  openM('m-credit');
+}
+
+// ════════════════════════════════════════════════════
+// DETALLE VENTA
+// ════════════════════════════════════════════════════
+async function verDetalle(k) {
+  const t = await idb.get('tx_dia', k);
+  if (!t) return;
+  document.getElementById('d-fecha').innerText   = fmtF(t.fecha);
+  document.getElementById('d-cliente').innerText = t.cliente;
+  const items = t.items || [];
+  let h = items.map(i =>
+    `<div class="tp-item"><div class="tp-item-name">${i.nombre}</div><div class="tp-item-qty">${i.cantidad}</div><div class="tp-item-precio">$${i.precio?.toFixed(2)||'—'}</div><div class="tp-item-total">$${(i.sub || i.cantidad*i.precio).toFixed(2)}</div></div>`
+  ).join('');
+  document.getElementById('d-items').innerHTML = h || '<div style="color:#94a3b8;font-size:12px;padding:6px 0">Sin detalle de productos</div>';
+  let th = `<div class="tp-row"><span style="font-size:13px;color:#64748b">TOTAL:</span><span class="tp-total-big">$${t.monto.toFixed(2)}</span></div>`;
+  th += `<div class="tp-row"><span style="font-size:13px;color:#64748b">PAGO:</span><span style="font-size:15px;font-weight:800">${t.metodo}</span></div>`;
+  if (t.metodo === 'Crédito') {
+    if (t.abono > 0) th += `<div class="tp-row"><span>Abono inicial:</span><span style="color:#16a34a;font-weight:700">$${t.abono.toFixed(2)}</span></div>`;
+    th += `<div class="tp-row"><span>Saldo pendiente:</span><span style="color:#dc2626;font-weight:800">$${t.saldo.toFixed(2)}</span></div>`;
+  }
+  th += `<div style="text-align:center;font-size:11px;color:#64748b;margin-top:8px;font-style:italic">Gracias por su compra ✨</div>`;
+  document.getElementById('d-total').innerHTML = th;
+  document.getElementById('d-cancelar-btn').setAttribute('data-uid', k);
+  document.getElementById('d-cancelar-btn').style.display = t.tipo === 'abono' ? 'none' : 'block';
+  openM('m-detalle');
+}
+
+async function cancelarVenta() {
+  const uid = document.getElementById('d-cancelar-btn').getAttribute('data-uid');
+  if (!uid) return;
+  const t = await idb.get('tx_dia', uid);
+  if (!t) return;
+  if (!confirm(`¿Cancelar venta de $${t.monto.toFixed(2)} a ${t.cliente}?\nEsta acción solo la borra de tus registros del día.`)) return;
+
+  // Borrar del TX día
+  await idb.del('tx_dia', uid);
+
+  // Revertir conteo de kg
+  const v = USER.nombre;
+  const getK = async k => (await idb.get('conteo', k)) || { uid: k, val: 0 };
+  for (const it of (t.items||[])) {
+    const g  = getGrupo(it.nombre);
+    const uk = `u_${v}_${g}`;
+    const ru = await getK(uk); ru.val = Math.max(0, ru.val - 1); await idb.put('conteo', ru);
+
+    if (g === 'tapas') {
+      const pk = `pzas_${v}_tapas`;
+      const rp = await getK(pk); rp.val = Math.max(0, rp.val - it.cantidad); await idb.put('conteo', rp);
+    } else {
+      const kk  = `kg_${v}_${g}`;
+      const rkg = await getK(kk); rkg.val = Math.max(0, rkg.val - it.cantidad); await idb.put('conteo', rkg);
+    }
+  }
+
+  // Si era crédito, borrar de creditos_vivos también
+  if (t.metodo === 'Crédito') {
+    const todos = await idb.all('creditos_vivos');
+    const cred  = todos.find(c => c.venta_uuid === uid);
+    if (cred) await idb.del('creditos_vivos', cred.uid);
+  }
+
+  // Borrar de colas pendientes (si no se había sincronizado)
+  await idb.del('ventas_q', uid);
+  const todosC = await idb.all('creditos_q');
+  const credQ  = todosC.find(c => c.venta_uuid === uid);
+  if (credQ) await idb.del('creditos_q', credQ.uid);
+
+  closeM('m-detalle');
+  toast('Venta cancelada', 'warn');
+  await mostrarResumen();
+  await mostrarCreditos();
+  await badgeSync();
+}
+
+// ════════════════════════════════════════════════════
+// RESUMEN — solo del vendedor logueado
+// ════════════════════════════════════════════════════
+async function mostrarResumen() {
+  const todas  = await idb.all('tx_dia');
+  const mias   = todas.filter(t => t.vendedor === USER.nombre);
+  const ventas = mias.filter(t => t.tipo==='venta'||t.tipo==='venta_con_abono');
+  const totV   = ventas.reduce((a,t) => a+t.monto, 0);
+  const contado= ventas.filter(t => t.metodo!=='Crédito').reduce((a,t) => a+t.monto, 0);
+  const cred   = ventas.filter(t => t.metodo==='Crédito').reduce((a,t) => a+t.monto, 0);
+  const nCred  = ventas.filter(t => t.metodo==='Crédito').length;
+  const abonos = mias.filter(t => t.tipo==='abono').reduce((a,t) => a+t.monto, 0);
+  const getK   = async k => ((await idb.get('conteo',k))||{val:0}).val;
+  const v      = USER.nombre;
+
+  document.getElementById('rTotal').innerText    = `$${totV.toFixed(2)}`;
+  document.getElementById('rContado').innerText  = `$${contado.toFixed(2)}`;
+  document.getElementById('rAbonos').innerText   = `$${abonos.toFixed(2)}`;
+  document.getElementById('rCredito').innerText  = `$${cred.toFixed(2)}`;
+  document.getElementById('rNCreditos').innerText= nCred;
+  document.getElementById('rCajas').innerText    = (await getK(`kg_${v}_cajas`)).toFixed(1);
+  document.getElementById('rMedias').innerText   = (await getK(`kg_${v}_medias`)).toFixed(1);
+  document.getElementById('rTapas').innerText    = await getK(`pzas_${v}_tapas`);
+  document.getElementById('rCajasU').innerText   = await getK(`u_${v}_cajas`);
+  document.getElementById('rMediasU').innerText  = await getK(`u_${v}_medias`);
+  document.getElementById('rTapasU').innerText   = await getK(`u_${v}_tapas`);
+
+  document.getElementById('txList').innerHTML = mias.length
+    ? [...mias].sort((a,b) => new Date(b.fecha)-new Date(a.fecha)).map(t => {
+        const isSale = t.tipo !== 'abono';
+        const ftag = t.folio ? `<span style="font-size:10px;color:#3b6ef8;font-weight:700;margin-left:4px">${t.folio}</span>` : '';
+        const quienCobro = t.tipo === 'abono' && t.vendedor ? ` · ${t.vendedor.toUpperCase().slice(0,3)}` : '';
+        return `<div class="tx-row">
+          <div class="tx-ico ${isSale?'s':'a'}">${isSale?'🛒':'💰'}</div>
+          <div class="tx-info">
+            <div class="tx-tipo">${t.tipo==='venta'?'Venta':t.tipo==='venta_con_abono'?'Venta+Abono':'Abono'}${ftag}</div>
+            <div class="tx-sub">${t.cliente} · ${t.metodo}${quienCobro}</div>
+          </div>
+          <span class="tx-monto">$${t.monto.toFixed(2)}</span>
+          <button class="tx-det" onclick="verDetalle('${t.uid}')"><i class="fas fa-search"></i></button>
+        </div>`;
+      }).join('')
+    : '<div style="text-align:center;padding:18px;color:var(--muted);font-size:13px">Sin movimientos hoy</div>';
+
+  document.getElementById('totalDia').innerText = `$${totV.toFixed(2)}`;
+}
+
+// ════════════════════════════════════════════════════
+// CORTE — solo del vendedor logueado
+// ════════════════════════════════════════════════════
+async function mostrarCorte() {
+  const box = document.querySelector('#m-corte .modal-box');
+  box.innerHTML = `<h3>📋 Corte del Día</h3><div id="corte-body"></div><div class="modal-btns" style="margin-top:14px"><button class="btn-ok" onclick="imprimirCorte()">🖨️ Imprimir</button><button style="padding:11px;background:#fee2e2;color:var(--red);border:none;border-radius:11px;cursor:pointer;font-weight:700;font-family:inherit" onclick="reiniciarDia()">Reiniciar</button><button style="padding:11px;background:var(--bg);color:var(--slate);border:1px solid var(--border);border-radius:11px;cursor:pointer;font-weight:700;font-family:inherit" onclick="closeM('m-corte')">Cerrar</button></div>`;
+
+  const todas  = await idb.all('tx_dia');
+  const mias   = todas.filter(t => t.vendedor === USER.nombre);
+  const ventas = mias.filter(t => t.tipo==='venta'||t.tipo==='venta_con_abono');
+  const totV   = ventas.reduce((a,t) => a+t.monto, 0);
+  const efec   = ventas.filter(t => t.metodo==='Efectivo').reduce((a,t) => a+t.monto, 0);
+  const trf    = ventas.filter(t => t.metodo==='Transf.').reduce((a,t) => a+t.monto, 0);
+  const credV  = ventas.filter(t => t.metodo==='Crédito').reduce((a,t) => a+t.monto, 0);
+  const abonosTx = mias.filter(t => t.tipo==='abono');
+  const ab     = abonosTx.reduce((a,t) => a+(t.monto||0), 0);
+  const aEntregar = efec + trf + ab;
+
+  const getK  = async k => ((await idb.get('conteo', k)) || { val: 0 }).val;
+  const v     = USER.nombre;
+  const kgCaj = await getK(`kg_${v}_cajas`);
+  const kgMed = await getK(`kg_${v}_medias`);
+  const uCaj  = await getK(`u_${v}_cajas`);
+  const uMed  = await getK(`u_${v}_medias`);
+  const uTap  = await getK(`u_${v}_tapas`);
+  const pzTap = await getK(`pzas_${v}_tapas`);
+  const kgTot = kgCaj + kgMed;
+
+  const renderClientes = (lista, color) => lista.map(t => {
+    const items = t.items || [];
+    const kilos = items.filter(i => i.unidad !== 'pza').reduce((a,i) => a+(i.cantidad||0), 0);
+    const precio = items[0]?.precio ? `$${parseFloat(items[0].precio).toFixed(2)}/kg` : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:var(--bg);border-radius:8px;margin-bottom:4px;font-size:12px">
+      <div><span style="font-weight:700">${t.cliente}</span>
+        ${kilos > 0 ? `<span style="color:var(--muted);margin-left:6px">${kilos.toFixed(1)} kg</span>` : ''}
+        ${precio ? `<span style="color:var(--muted);margin-left:4px">· ${precio}</span>` : ''}
+        ${t.folio ? `<span style="color:var(--blue);margin-left:4px;font-size:10px">${t.folio}</span>` : ''}
+      </div>
+      <span style="font-weight:800;color:${color}">$${t.monto.toFixed(2)}</span>
+    </div>`;
+  }).join('');
+
+  const renderAbonos = (lista) => lista.map(t =>
+    `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:var(--bg);border-radius:8px;margin-bottom:4px;font-size:12px">
+      <div><span style="font-weight:700">${t.cliente}</span>
+        ${t.saldo > 0 ? `<span style="color:var(--red);margin-left:6px;font-size:11px">Saldo: $${t.saldo.toFixed(2)}</span>` : '<span style="color:var(--green);margin-left:6px;font-size:11px">✅ Liquidado</span>'}
+      </div>
+      <span style="font-weight:800;color:var(--teal)">+$${t.monto.toFixed(2)}</span>
+    </div>`
+  ).join('');
+
+  const vEfec = ventas.filter(t => t.metodo==='Efectivo');
+  const vTrf  = ventas.filter(t => t.metodo==='Transf.');
+  const vCred = ventas.filter(t => t.metodo==='Crédito');
+
+  document.getElementById('corte-body').innerHTML = `
+    <div style="background:#eef2ff;border-radius:10px;padding:8px 12px;margin-bottom:12px;font-size:12px;color:#3730a3;font-weight:700">
+      <i class="fas fa-user" style="font-size:11px"></i> ${USER.nombre} · ${new Date().toLocaleDateString('es-MX')}
+    </div>
+    ${vEfec.length ? `<div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:4px;text-transform:uppercase">💵 Efectivo</div>${renderClientes(vEfec,'var(--green)')}<div class="cline" style="margin-bottom:10px"><span>Subtotal efectivo</span><strong style="color:var(--green)">$${efec.toFixed(2)}</strong></div>` : ''}
+    ${vTrf.length ? `<div style="font-size:11px;font-weight:700;color:var(--blue);margin-bottom:4px;text-transform:uppercase">📲 Transferencia</div>${renderClientes(vTrf,'var(--blue)')}<div class="cline" style="margin-bottom:10px"><span>Subtotal transferencia</span><strong style="color:var(--blue)">$${trf.toFixed(2)}</strong></div>` : ''}
+    ${vCred.length ? `<div style="font-size:11px;font-weight:700;color:var(--amber);margin-bottom:4px;text-transform:uppercase">⏳ Créditos nuevos</div>${renderClientes(vCred,'var(--amber)')}<div class="cline" style="margin-bottom:10px"><span>Subtotal créditos</span><strong style="color:var(--amber)">$${credV.toFixed(2)}</strong></div>` : ''}
+    ${abonosTx.length ? `<div style="font-size:11px;font-weight:700;color:var(--teal);margin-bottom:4px;text-transform:uppercase">💰 Abonos cobrados</div>${renderAbonos(abonosTx)}<div class="cline" style="margin-bottom:10px"><span>Subtotal abonos</span><strong style="color:var(--teal)">$${ab.toFixed(2)}</strong></div>` : ''}
+    <div style="border-top:2px solid var(--border);padding-top:10px">
+      <div class="cbig">$${aEntregar.toFixed(2)}</div>
+      <div style="text-align:center;font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:12px">A entregar (efectivo + transf + abonos)</div>
+    </div>
+    <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;border-top:1px solid var(--border);padding-top:8px">Productos del día</div>
+    <div class="cline"><span>📦 Cajas (${uCaj})</span><span style="font-weight:600">${kgCaj.toFixed(1)} kg</span></div>
+    <div class="cline"><span>📂 ½ Cajas (${uMed})</span><span style="font-weight:600">${kgMed.toFixed(1)} kg</span></div>
+    <div class="cline"><span>🔴 Tapas (${uTap} veces)</span><span style="font-weight:600">${pzTap} piezas</span></div>
+    <div class="cline"><span><strong>Total kg</strong></span><strong>${kgTot.toFixed(1)} kg</strong></div>
+    <div class="cline"><span>Total vendido</span><strong>$${totV.toFixed(2)}</strong></div>
+    <div style="height:10px"></div>
+    <button onclick="desglosarDia()" style="width:100%;padding:11px;background:#eef2ff;color:var(--blue);border:1.5px solid #c7d7fe;border-radius:13px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit">
+      <i class="fas fa-list-ul"></i> Ver todos los movimientos
+    </button>`;
+
+  openM('m-corte');
+}
+
+async function imprimirCorte() {
+  const todas    = await idb.all('tx_dia');
+  const mias     = todas.filter(t => t.vendedor === USER.nombre);
+  const ventas   = mias.filter(t => t.tipo==='venta'||t.tipo==='venta_con_abono');
+  const abonosTx = mias.filter(t => t.tipo==='abono');
+  const efecL    = ventas.filter(t => t.metodo==='Efectivo');
+  const trfL     = ventas.filter(t => t.metodo==='Transf.');
+  const credL    = ventas.filter(t => t.metodo==='Crédito');
+  const totEfec  = efecL.reduce((a,t)=>a+t.monto,0);
+  const totTrf   = trfL.reduce((a,t)=>a+t.monto,0);
+  const totCred  = credL.reduce((a,t)=>a+t.monto,0);
+  const totAb    = abonosTx.reduce((a,t)=>a+t.monto,0);
+  const totV     = ventas.reduce((a,t)=>a+t.monto,0);
+  const aEntregar= totEfec + totTrf + totAb;
+
+  const getK  = async k => ((await idb.get('conteo', k)) || { val: 0 }).val;
+  const v     = USER.nombre;
+  const kgCaj = await getK(`kg_${v}_cajas`);
+  const kgMed = await getK(`kg_${v}_medias`);
+  const uCaj  = await getK(`u_${v}_cajas`);
+  const uMed  = await getK(`u_${v}_medias`);
+  const uTap  = await getK(`u_${v}_tapas`);
+  const pzTap = await getK(`pzas_${v}_tapas`);
+  const kgTot = kgCaj + kgMed;
+
+  const W   = 32;
+  const sep = () => '-'.repeat(W);
+  const ctr = s => { const sp = Math.max(0,Math.floor((W-s.length)/2)); return ' '.repeat(sp)+s; };
+  const pad = (l,r) => { const sp = W-l.length-r.length; return l+' '.repeat(Math.max(1,sp))+r; };
+  const NL  = '
+';
+
+  const linClientes = (lista) => lista.map(t => {
+    const items = t.items||[];
+    const kilos = items.filter(i=>i.unidad!=='pza').reduce((a,i)=>a+(i.cantidad||0),0);
+    const det = kilos>0 ? ` ${kilos.toFixed(1)}kg` : '';
+    return pad(t.cliente.substring(0,18)+det, '$'+t.monto.toFixed(2));
+  }).join(NL);
+
+  let txt = '';
+  txt += ctr('DISFER') + NL;
+  txt += ctr('Distribuidora de huevo') + NL;
+  txt += ctr(new Date().toLocaleDateString('es-MX')+' '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})) + NL;
+  txt += sep() + NL;
+  txt += ctr('CORTE DEL DIA') + NL;
+  txt += ctr(USER.nombre) + NL;
+  txt += sep() + NL;
+  if (efecL.length)  { txt += 'EFECTIVO' + NL + linClientes(efecL) + NL + pad('Subtotal:','$'+totEfec.toFixed(2)) + NL + NL; }
+  if (trfL.length)   { txt += 'TRANSFERENCIA' + NL + linClientes(trfL) + NL + pad('Subtotal:','$'+totTrf.toFixed(2)) + NL + NL; }
+  if (credL.length)  {
+    txt += 'CREDITOS NUEVOS' + NL;
+    txt += credL.map(t => {
+      const items=t.items||[];
+      const kilos=items.filter(i=>i.unidad!=='pza').reduce((a,i)=>a+(i.cantidad||0),0);
+      const saldoStr=t.saldo>0?`Saldo:$${t.saldo.toFixed(2)}`:'Liquidado';
+      return pad(t.cliente.substring(0,16),'$'+t.monto.toFixed(2)) + NL + '  '+(kilos>0?kilos.toFixed(1)+'kg ':'')+saldoStr;
+    }).join(NL) + NL;
+    txt += pad('Subtotal:','$'+totCred.toFixed(2)) + NL + NL;
+  }
+  if (abonosTx.length) {
+    txt += 'ABONOS COBRADOS' + NL;
+    txt += abonosTx.map(t=>pad(t.cliente.substring(0,18),'+$'+t.monto.toFixed(2))).join(NL) + NL;
+    txt += pad('Subtotal:','$'+totAb.toFixed(2)) + NL + NL;
+  }
+  txt += sep() + NL;
+  txt += pad('TOTAL VENDIDO:','$'+totV.toFixed(2)) + NL;
+  txt += pad('A ENTREGAR:','$'+aEntregar.toFixed(2)) + NL;
+  txt += sep() + NL;
+  txt += 'PRODUCTOS DEL DIA' + NL;
+  txt += pad('Cajas ('+uCaj+'):',kgCaj.toFixed(1)+' kg') + NL;
+  txt += pad('Med Cajas ('+uMed+'):',kgMed.toFixed(1)+' kg') + NL;
+  txt += pad('Tapas ('+uTap+'x):',pzTap+' pzas') + NL;
+  txt += pad('Total kg:',kgTot.toFixed(1)+' kg') + NL;
+  txt += sep() + NL;
+  txt += NL + NL + NL + NL;
+
+  try {
+    const dev  = await navigator.bluetooth.requestDevice({filters:[{services:['000018f0-0000-1000-8000-00805f9b34fb']}]});
+    const srv  = await dev.gatt.connect();
+    const svc  = await srv.getPrimaryService('000018f0-0000-1000-8000-00805f9b34fb');
+    const char = await svc.getCharacteristic('00002af1-0000-1000-8000-00805f9b34fb');
+    const enc  = new TextEncoder();
+    const data = enc.encode(txt);
+    for (let i=0;i<data.length;i+=512) await char.writeValue(data.slice(i,i+512));
+    toast('Corte impreso ✅','ok');
+  } catch {
+    const win = window.open('','_blank','width=400,height=600');
+    win.document.write('<html><body><pre style="font-family:monospace;font-size:13px;white-space:pre-wrap">'+txt+'</pre></body></html>');
+    win.document.close(); win.print();
+  }
+}
