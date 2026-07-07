@@ -1333,10 +1333,10 @@ async function doLogin() {
     while (!db && intentos < 10) { await new Promise(r => setTimeout(r, 300)); intentos++; }
     if (!db) { err.textContent = 'Base de datos no lista. Recarga.'; btn.disabled = false; btn.textContent = 'Ingresar al sistema'; return; }
 
-    // Consultar Supabase
+    // Consultar tabla vendedores
     let res;
     try {
-      res = await sb.from('usuarios').select('id,nombre,password,rol,activo').eq('nombre', nom).eq('activo', true).single();
+      res = await sb.from('vendedores').select('identificador,nombre,codigo,activo').eq('nombre', nom).eq('activo', true).single();
     } catch(e) {
       err.textContent = 'Error de red: ' + e.message;
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
@@ -1355,15 +1355,15 @@ async function doLogin() {
       return;
     }
 
-    if (res.data.password !== cod) {
-      err.textContent = 'Contraseña incorrecta';
+    if (res.data.codigo !== cod) {
+      err.textContent = 'Código incorrecto';
       btn.disabled = false; btn.textContent = 'Ingresar al sistema';
       return;
     }
 
     // Login exitoso
     online = true;
-    USER = { nombre: res.data.nombre, id: res.data.id, rol: res.data.rol || 'vendedor' };
+    USER = { nombre: res.data.nombre, id: res.data.identificador, rol: 'vendedor' };
     await idb.put('config', { uid: 'session', nombre: USER.nombre, id: USER.id, rol: USER.rol });
     await arrancar();
 
@@ -1958,4 +1958,4 @@ async function finalizarVenta() {
   const snapPago  = pago;
 
   // Mostrar ticket de inmediato
-  ticketVenta(c
+  ticketVen
